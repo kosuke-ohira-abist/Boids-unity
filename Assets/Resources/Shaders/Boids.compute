@@ -1,0 +1,258 @@
+#pragma kernel GridCS
+#pragma kernel ForceCS
+#pragma kernel IntegrateCS
+
+struct BoidData
+{
+    float3 position;
+    float3 velocity;
+};
+
+#define THREAD_SIZE 256
+#define GRID_WIDTH 8
+#define GRID_HEIGHT 8
+#define GRID_DEPTH 8
+
+StructuredBuffer<int> _BoidGridBufferRead;
+RWStructuredBuffer<int> _BoidGridBufferWrite;
+StructuredBuffer<BoidData> _BoidDataBufferRead;
+RWStructuredBuffer<BoidData> _BoidDataBufferWrite;
+StructuredBuffer<float3> _BoidForceBufferRead;
+RWStructuredBuffer<float3> _BoidForceBufferWrite;
+
+int _MaxObjectNum;
+float _DeltaTime;
+
+float _SeparateNeighborhoodRadius;
+float _AlignmentNeighborhoodRadius;
+float _CohesionNeighborhoodRadius;
+
+float _MaxSpeed;
+float _MaxSteerForce;
+
+float _SeparateWeight;
+float _AlignmentWeight;
+float _CohesionWeight;
+
+float3 _WallCenter;
+float3 _WallSize;
+float  _AvoidWallWeight;
+
+groupshared int sharedCurrentBoidsIndex;
+
+float3 limit(float3 vec, float maxlen)
+{
+    float len = sqrt(dot(vec, vec));
+    return (len > maxlen && len > 0) ? vec * (maxlen / len) : vec;
+}
+
+float3 avoidWall(float3 pos)
+{
+    float3 wc = _WallCenter;
+    float3 ws = _WallSize;
+    float3 avoidForce = (float3)0.0;
+
+    avoidForce.x = (pos.x < (wc.x - ws.x * 0.5)) ? avoidForce.x + 1.0 : avoidForce.x;
+    avoidForce.x = (pos.x > (wc.x + ws.x * 0.5)) ? avoidForce.x - 1.0 : avoidForce.x;
+    avoidForce.y = (pos.y < (wc.y - ws.y * 0.5)) ? avoidForce.y + 1.0 : avoidForce.y;
+    avoidForce.y = (pos.y > (wc.y + ws.y * 0.5)) ? avoidForce.y - 1.0 : avoidForce.y;
+    avoidForce.z = (pos.z < (wc.z - ws.z * 0.5)) ? avoidForce.z + 1.0 : avoidForce.z;
+    avoidForce.z = (pos.z > (wc.z + ws.z * 0.5)) ? avoidForce.z - 1.0 : avoidForce.z;
+
+    return avoidForce;
+}
+
+// 空間分割による最適化処理
+[numthreads(THREAD_SIZE,1,1)]
+void GridCS(
+    uint3 groupId          : SV_GroupID,
+    uint3 dispatchThreadId : SV_DispatchThreadID,
+    uint3 groupThreadId    : SV_GroupThreadID)
+{
+    int groupIndex = (int)(groupId.x + groupId.y * GRID_WIDTH + groupId.z * GRID_WIDTH * GRID_HEIGHT);
+    int ingroupIndex = (int)groupThreadId.x;
+    if(ingroupIndex == 0)
+    {
+        sharedCurrentBoidsIndex = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    float3 wc = _WallCenter;
+    float3 ws = _WallSize;
+    for(int i = ingroupIndex; i < _MaxObjectNum; i += THREAD_SIZE)
+    {
+        float3 pos = _BoidDataBufferRead[i].position;
+        uint x = (uint)fmod(pos.x - wc.x + ws.x * 0.5, GRID_WIDTH);
+        uint y = (uint)fmod(pos.y - wc.y + ws.y * 0.5, GRID_HEIGHT);
+        uint z = (uint)fmod(pos.z - wc.z + ws.z * 0.5, GRID_DEPTH);
+        if((x == groupId.x) && (y == groupId.y) && (z == groupId.z))
+        {
+            int id;
+            InterlockedAdd(sharedCurrentBoidsIndex, 1, id);
+            _BoidGridBufferWrite[groupIndex * _MaxObjectNum + id] = i;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if(ingroupIndex == 0)
+    {
+        // 番兵
+        _BoidGridBufferWrite[groupIndex * _MaxObjectNum + sharedCurrentBoidsIndex] = -1;
+    }
+}
+
+// 各オブジェクトが受ける力の計算
+[numthreads(THREAD_SIZE,1,1)]
+void ForceCS(
+    uint3 groupId          : SV_GroupID,
+    uint3 dispatchThreadId : SV_DispatchThreadID,
+    uint3 groupThreadId    : SV_GroupThreadID)
+{
+    int idx = (int)dispatchThreadId.x;
+    float3 pos = _BoidDataBufferRead[idx].position;
+    float3 vel = _BoidDataBufferRead[idx].velocity;
+
+    float3 wc = _WallCenter;
+    float3 ws = _WallSize;
+    float3 relpos = pos - wc + ws * 0.5;
+    int x = (int)fmod(relpos.x, GRID_WIDTH);
+    int y = (int)fmod(relpos.y, GRID_HEIGHT);
+    int z = (int)fmod(relpos.z, GRID_DEPTH);
+
+    float3 sepForce = (float3)0.0;
+    int sepCount = 0;
+
+    float3 aliForce = (float3)0.0;
+    int aliCount = 0;
+
+    float3 cohForce = (float3)0.0;
+    int cohCount = 0;
+
+    // 周囲のgroupIndexを取得
+    int groupIndices[27];
+    int i = 0;
+    for (int dz = -1; dz <= 1; ++dz)
+    {
+        for (int dy = -1; dy <= 1; ++dy)
+        {
+            for (int dx = -1; dx <= 1; ++dx)
+            {
+                int neighborX = x + dx;
+                int neighborY = y + dy;
+                int neighborZ = z + dz;
+
+                if (neighborX < 0 || neighborX >= GRID_WIDTH ||
+                    neighborY < 0 || neighborY >= GRID_HEIGHT ||
+                    neighborZ < 0 || neighborZ >= GRID_DEPTH)
+                {
+                    // invalid
+                    groupIndices[i] = -1;
+                }
+                else
+                {
+                    groupIndices[i] = neighborX + neighborY * GRID_WIDTH + neighborZ * GRID_WIDTH * GRID_HEIGHT;
+                }
+                ++i;
+            }
+        }
+    }
+
+    float maxRadius = max(_SeparateNeighborhoodRadius, max(_AlignmentNeighborhoodRadius, _CohesionNeighborhoodRadius));
+
+    for(int ni = 0; ni < 27; ++ni)
+    {
+        if(groupIndices[ni] == -1)
+        {
+            continue;
+        }
+
+        for(int i = 0; i < _MaxObjectNum; ++i)
+        {
+            uint k = _BoidGridBufferRead[groupIndices[ni] * _MaxObjectNum + i];
+            if(k == -1)
+            {
+                break;
+            }
+
+            float3 otherPos = _BoidDataBufferRead[k].position;
+            float3 otherVel = _BoidDataBufferRead[k].velocity;
+
+            // 他の個体との距離計算
+            float3 diff = pos - otherPos;
+            float diffSq = dot(diff, diff);
+            if(diffSq > (maxRadius * maxRadius))
+            {
+                continue;
+            }
+            float dist = sqrt(diffSq);
+
+            // 分離
+            if(dist > 0.0 && dist <= _SeparateNeighborhoodRadius)
+            {
+                // 距離が遠いほど重みを小さくする
+                float3 repulse = normalize(pos - otherPos);
+                repulse /= dist;
+                sepForce += repulse;
+                sepCount += 1;
+            }
+
+            // 整列
+            if(dist > 0.0 && dist <= _AlignmentNeighborhoodRadius)
+            {
+                aliForce += otherVel;
+                aliCount += 1;
+            }
+
+            // 結合
+            if(dist > 0.0 && dist <= _CohesionNeighborhoodRadius)
+            {
+                cohForce += otherPos;
+                cohCount += 1;
+            }
+        }
+    }
+
+    // 力の計算
+    if(sepCount > 0)
+    {
+        sepForce = _MaxSpeed * normalize(sepForce);
+        sepForce -= vel;
+        sepForce = limit(sepForce, _MaxSteerForce);
+    }
+    if(aliCount > 0)
+    {
+        aliForce = _MaxSpeed * normalize(aliForce);
+        aliForce -= vel;
+        aliForce = limit(aliForce, _MaxSteerForce);
+    }
+    if(cohCount > 0)
+    {
+        cohForce /= cohCount;
+        cohForce -= pos;
+        cohForce = normalize(cohForce) * _MaxSpeed;
+        cohForce -= vel;
+        cohForce = limit(cohForce, _MaxSteerForce);
+    }
+    float3 force = (float3)0.0;
+    force += sepForce * _SeparateWeight;
+    force += aliForce * _AlignmentWeight;
+    force += cohForce * _CohesionWeight;
+
+    _BoidForceBufferWrite[idx] = force;
+}
+
+// 壁を考慮した力を各オブジェクトに適用
+[numthreads(THREAD_SIZE, 1, 1)]
+void IntegrateCS(uint3 id : SV_DispatchThreadID)
+{
+    int idx = (int)id.x;
+    BoidData data = _BoidDataBufferRead[idx];
+    float3 force = _BoidForceBufferRead[idx];
+
+    force += avoidWall(data.position) * _AvoidWallWeight;
+    data.velocity += force * _DeltaTime;
+    data.velocity = limit(data.velocity, _MaxSpeed);
+    data.position += data.velocity * _DeltaTime;
+
+    _BoidDataBufferWrite[idx] = data;
+}
